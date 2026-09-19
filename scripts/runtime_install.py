@@ -29,6 +29,21 @@ from crw_runtime.text import text_prefix
 
 ROOT = Path(__file__).resolve().parents[1]
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE = 0, 1, 2
+# A fourth answer, because replacing a runtime and RECORDING that it was replaced are two
+# results and one status cannot carry both. The staging claim is written last, after the
+# selection is committed and the owned pointer is placed and read back, so by the time it can
+# fail a host already reaches the new runtime through the registered command. Reporting that as
+# EXIT_REFUSED says nothing was replaced, about a host that has already moved; reporting it as
+# EXIT_OK says bookkeeping landed that did not. Nothing before the claim exits this way: every
+# earlier failure leaves the previous runtime selected and reachable, which is a refusal.
+#
+# A WRAPPER MUST NOT READ THIS AS A FREE DESTINATION. Non-zero here means the opposite of what
+# it means everywhere else in this command: the candidate was promoted, it is selected, the
+# owned pointer names it, and a host is running out of it. A caller that treats every non-zero
+# install status as "nothing happened, clean it up" would delete the runtime in service. The
+# release path is reached only by EXIT_REFUSED; these two statuses keep the environment
+# deliberately, which is why they are declared together and why the result says 'promoted'.
+EXIT_INCOMPLETE = 3
 
 # The two components, named once. The MCP server name spells the bridge's component name, and
 # that shared spelling is stated here rather than left for a reader to infer from two literals
@@ -2510,8 +2525,11 @@ def cmd_install(args):
                     "resumed": True,
                     "note": "a previous run committed this environment as selected and did not"
                             " live to move the pointer. Nothing was rebuilt and nothing was"
-                            " removed: the missing half of that promotion was written and the"
-                            " claim settled."})
+                            " removed: the missing half of that promotion was written. Whether"
+                            " the claim that RECORDS it settled is reported separately in"
+                            " 'claimSettled', because the pointer and the record are written at"
+                            " different moments and a note speaking for both would be speaking"
+                            " for one it never read."})
             if decision == staging.RECORDED:
                 # An installation made before this command wrote claims. It carries no claim,
                 # so every earlier reading called it somebody else's directory and refused --
@@ -2523,8 +2541,9 @@ def cmd_install(args):
                     "adopted": True,
                     "note": "this installation was made before this command wrote staging"
                             " claims, and the host record selects it. It is brought under this"
-                            " command's bookkeeping -- a claim, and a pointer to reach it"
-                            " through -- so the NEXT update can move it. Nothing was rebuilt,"
+                            " command's bookkeeping -- the pointer it is reached through, and"
+                            " the claim reported in 'claimSettled' -- so the NEXT update can"
+                            " move it. Nothing was rebuilt,"
                             " nothing was removed, and the runtime a host reaches is the one"
                             " the record already selected. Its bytes were not re-measured"
                             " here: this run replaced nothing, and the swap gate is asked"
@@ -2938,15 +2957,28 @@ def cmd_install(args):
                                    failed_step="promote under the promotion lock")
 
         # The claim settles last. It says this staging finished, and until the selection and the
-        # pointer both name it there is nothing finished to say.
-        staging.write_claim(environment, staging.COMPLETE, issue=args.issue,
-                            run=str(os.getpid()))
+        # pointer both name it there is nothing finished to say. Which makes it the one step
+        # whose failure finds the replacement already done, so it answers rather than raises
+        # and the result carries the two outcomes side by side.
+        settled = _settle_claim(environment, staging.COMPLETE, issue=args.issue,
+                                run=str(os.getpid()))
 
         emit({
             "command": "install", "applied": True, "environment": str(environment),
             "hostRecord": str(record_path), "steps": performed, "installs": installs,
             "measurement": measurement,
             "promoted": True,
+            # Two answers, never one. 'promoted' is the replacement -- the selection is
+            # committed and the pointer resolves into this environment -- and 'claimSettled' is
+            # the record of it. They are written at different moments and they can differ, and a
+            # result that folded them together reported a host that had already moved as a host
+            # that had not.
+            "claimSettled": settled["settled"],
+            "claim": settled,
+            # The same key a refusal reports it under, so a reader looking for what has to be
+            # done next finds the answer in one place whichever exit they are reading. None when
+            # there is nothing outstanding.
+            "recoveryRequires": settled["recoveryRequires"],
             "swapGate": gate,
             "pointer": {"path": str(pointer_path), "target": str(environment),
                         "previousTarget": before.get("target"),
@@ -2965,9 +2997,13 @@ def cmd_install(args):
                 " the store."
             ),
         })
-        # Reached only when the candidate qualified AND classified own, so this is the one
-        # success return after ownership; every other exit goes through the release path.
-        return EXIT_OK
+        # Reached only when the candidate qualified, classified own and was promoted, so this is
+        # the one return after ownership that KEEPS the directory: it is the runtime a host now
+        # reaches, and releasing it would delete what this run just put into service. Every
+        # other exit goes through the release path. Which of the two promoted statuses it is
+        # turns on the record alone, so it is chosen here rather than at a second return that
+        # nothing would hold to the same rule.
+        return EXIT_OK if settled["settled"] else EXIT_INCOMPLETE
 
 
     except reading.Refused as stop:
@@ -2982,6 +3018,120 @@ def cmd_install(args):
         # that reaches an end of its own says so itself rather than leaving the answer to exit.
         if holder is not None:
             holder.__exit__()
+
+
+def _settle_claim(environment, state, *, issue, run):
+    """Write the claim that says this staging finished, and answer whether the RECORD landed.
+
+    The claim settles last on purpose: it says the replacement finished, and until the selection
+    and the pointer both name this environment there is nothing finished to say. That ordering
+    is what makes its failure unlike every other failure in this command. Everything before it
+    fails with the previous runtime still selected and still reachable -- a refusal, and the
+    result says so truthfully. By the time this one can fail the selection is committed, the
+    pointer is placed and read back, and the registered command resolves into this environment:
+    THE REPLACEMENT HAPPENED. Only the record of it did not.
+
+    Left to raise, that went out through the handler for failures this command does not model
+    and was reported as an update failure -- false in the direction that matters. The operator
+    read 'applied: false', a pointer of null, and a destination that 'cannot be retried until
+    the selection moves', and none of it said the host had already moved. So this ANSWERS
+    instead of raising, and the caller reports the record beside the replacement rather than in
+    place of it.
+
+    What the next run should do is part of the answer rather than left to the reader, because
+    only here is it known which half is missing. A promotion that could not settle leaves the
+    claim its staging wrote -- STAGING -- over a selection and a pointer that both name this
+    environment, and that is exactly the state staging.decide() reads as RESUME: the next run
+    finishes the bookkeeping, rebuilds nothing and removes nothing. An installation that never
+    wrote a first claim leaves none at all, which the same reading answers with RECORDED for
+    the same repair. Either way the destination is not stuck and the runtime is not at risk,
+    which is the opposite of what the update failure said.
+
+    OSError is the whole of what is caught, and hostrecord.Busy is an OSError: a lock this run
+    could not take and a file it could not write are the same answer here. Anything else is a
+    defect in this command rather than a record that would not write, and a defect reported as
+    a settled-looking outcome is how one stops being found.
+
+    AND THE RECORD HAS THE SAME SPLIT THE RESULT DOES, so it gets the same treatment rather
+    than a branch. Writing the claim is two steps: the bytes are replaced under
+    hostrecord.Locked, and the lock is released afterwards. A failure in the SECOND raises with
+    the new bytes already on disk, and reading that as an unsettled record is this very
+    substitution one layer down -- it would send an operator to repair bookkeeping that is
+    already correct. So the answer carries two outcomes of its own, decided by two different
+    readings:
+
+      'settled'  -- did the RECORD land. Decided by reading the claim back, never by the
+                    exception, because an exception says the call did not finish.
+      'released' -- did the CALL finish. False whenever anything raised, whatever landed.
+
+    What failed afterwards is then named as itself rather than folded into the record's
+    outcome. A release that failed leaves the lock file it could not unlink, and that file is
+    not cosmetic: the next claim write at this path waits on it and then refuses until it is
+    gone or older than hostrecord.STALE_LOCK_SECONDS. So it is read on the filesystem, reported
+    as a residual path, and carried into the recovery sentence -- the same shape _install_failed
+    already reports residue in, for the same reason.
+
+    Fail closed where the readback itself failed. A claim nobody could read establishes
+    nothing, and it is not the same case as one that is merely missing: staging.decide()
+    answers KEEP for an unreadable claim, so the next run refuses this directory instead of
+    repairing it. The advice has to differ because the behaviour does, which is why it is
+    derived from the reading rather than written once for every failure.
+    """
+    path = staging.claim_path(environment)
+    try:
+        staging.write_claim(environment, state, issue=issue, run=run)
+    except OSError as error:
+        raised = type(error).__name__ + ": " + error.__str__()
+    else:
+        # No reading was made here, and none is reported. A cell carrying a reading its own
+        # question never produced is the habit the rest of this module is written against.
+        return {"path": str(path), "settled": True, "released": True, "wanted": state,
+                "detail": None, "readBack": None, "residualPaths": [],
+                "recoveryRequires": None}
+
+    left = staging.read_claim(environment)
+    says = (left.value or {}).get("state") if left.ok else None
+    settled = says == state
+    # Read on the filesystem rather than inferred from the exception. Which step raised is not
+    # knowable from here, and whether the lock outlived it is a fact about the directory.
+    stranded = Path(str(path) + hostrecord.LOCK_SUFFIX)
+    residual = [str(stranded)] if stranded.exists() else []
+
+    if settled:
+        record_requires = None
+    elif left.usable:
+        record_requires = (
+            "clear whatever stopped the write at " + str(path) + " -- the error is in"
+            " 'detail' -- and then run install again against the same destination. The"
+            " replacement itself finished: this environment is selected and the owned pointer"
+            " names it, so there is nothing to rebuild and nothing to undo, and what is"
+            " missing is only the claim that records it. A rerun writes that claim: it reads a"
+            " selected environment whose claim never settled as an interrupted promotion and"
+            " finishes the bookkeeping. BUT ONLY ONCE THE WRITE CAN SUCCEED -- rerunning while"
+            " the same thing stops it reaches the same failure and returns this same result,"
+            " without rebuilding or removing anything. Until it settles, this destination"
+            " carries a runtime that is in service and a claim that does not say so.")
+    else:
+        record_requires = (
+            "make the claim at " + str(path) + " readable or remove it, then run install"
+            " again. The replacement itself finished and this environment is in service, so it"
+            " must not be deleted -- but rerunning alone will NOT repair this one: a claim that"
+            " cannot be read is not a claim this command may act on, so the next run reports"
+            " the directory and leaves it exactly as it stands rather than finishing the"
+            " promotion.")
+    residue_requires = None if not residual else (
+        "remove " + str(stranded) + " by hand. The lock taken to write this claim outlived the"
+        " call that took it, so the next claim write at this path waits on that file and then"
+        " refuses, until it is gone or older than " + str(hostrecord.STALE_LOCK_SECONDS)
+        + " seconds. It holds no runtime and removing it destroys nothing.")
+    return {"path": str(path), "settled": settled, "released": False, "wanted": state,
+            "detail": raised,
+            "readBack": {"state": left.state, "saying": says, "detail": left.detail},
+            "residualPaths": residual,
+            # Composed the way a refusal composes its own, so a reader meets one sentence
+            # covering everything outstanding rather than one per thing that went wrong.
+            "recoveryRequires": "; and ".join(
+                part for part in (record_requires, residue_requires) if part) or None}
 
 
 def _finish_promotion(record_path, data, environment, pointer_path, standing, *, issue,
@@ -3103,12 +3253,17 @@ def _finish_promotion(record_path, data, environment, pointer_path, standing, *,
                                         " record already selects",
                       pointerRestored=put_back, **_outstanding_ownership(put_back)))
             return EXIT_REFUSED
-    staging.write_claim(environment, staging.COMPLETE, issue=issue, run=str(os.getpid()))
+    # Outside the lock, and previously outside every handler too: an OSError here escaped this
+    # function, escaped cmd_install through a finally with no except, and left the command with
+    # no result and no exit status at all -- for a repair that had already written the pointer.
+    settled = _settle_claim(environment, staging.COMPLETE, issue=issue, run=str(os.getpid()))
     emit(dict(standing, applied=True,
               pointer={"path": str(pointer_path), "previousTarget": before.get("target"),
                        "target": str(environment)},
+              claimSettled=settled["settled"], claim=settled,
+              recoveryRequires=settled["recoveryRequires"],
               **reported))
-    return EXIT_OK
+    return EXIT_OK if settled["settled"] else EXIT_INCOMPLETE
 
 
 def _inherited_registration(registration, record, data):
