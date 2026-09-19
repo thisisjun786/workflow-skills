@@ -214,10 +214,44 @@ exists before the relationship and is answerable without asking the relay anythi
 | A fact that names nothing has registered nothing | the relationship record was tested for truthiness rather than for its identity, so one carrying a blank or missing relationshipId read as registered; the receipt lookup then refused the unnamed id and the turn landed on receipt_missing, telling the child to emit a receipt that nothing could satisfy. The identity is what is tested, the same way the bind record has always been |
 | A failed publication leaves no litter | the temp is this call's own, so a write or fsync failure removes it; leaving it turned a transient fault into an unbounded pile of orphans in a directory every reader walks |
 
+## Three-level linkage and execution ownership
+
+The records these rows constrain are described in [linkage.md](linkage.md); the role contract
+they implement is OPS-7.4 and the shared "Supervisor, parent and child scope".
+
+| # | Invariant | Enforced in | Status |
+|---|---|---|---|
+| I-150 | A scope has one live owner per role | partial unique index on `scope_bindings`, and `linkage._binding_refusal` before it | implemented |
+| I-151 | A task holds one live scope per role; a second live binding of the same role is refused rather than silently tie-broken | `linkage._binding_refusal` → `role_already_bound` | implemented |
+| I-152 | Only `(initiative, project)` and `(project, issue)` are execution edges, so a reference or a peer row can neither lengthen a chain nor add an owner | every walk filters `link_kind = 'execution'` in SQL: `linkage.down`, `_descend`, `up` | implemented |
+| I-153 | A project has at most one live execution supervision, whichever initiative asks | `linkage._supervision_refusal` → `duplicate_scope_owner` | implemented |
+| I-154 | A reference carries no directive authority and cannot be a project's first link | `linkage._supervision_refusal` → `unregistered_scope`; `record_directive` refuses a directive arriving on a reference edge | implemented |
+| I-155 | The initiative that supervises a project cannot also reference it, so one scope pair never holds two live edges | `linkage._supervision_refusal` → `link_conflict` | implemented |
+| I-156 | A peer link between two parents introduces no cycle and no second execution owner | `linkage.register_peer` and the `_reaches` walk | implemented |
+| I-157 | An issue is attached only by the project's live parent, or by a genuine successor: one superseding an assignment that is scoped to that project, assigned to this same issue, and either still live or being taken over by this very registration | `linkage.attach_refusal` → `foreign_scope`, agreeing with `replaceable_child_in` on the write side | implemented |
+| I-158 | An issue has one live assignment, decided on the relationship rather than on the child task | `registry._register_in_transaction` → `duplicate_assignment`; `linkage._owns_its_issue` for the lower level | implemented |
+| I-159 | A replacement owner restates the outgoing owner and the unfinished work, and a handover that cannot move the whole endpoint refuses and names what it could not move | `linkage.handover` with `attached(other_than=...)` → `handover_unconfirmed`, `handover_would_strand` | implemented |
+| I-160 | Reactivating an assignment cannot install a stale owner: the project must still be parented by the task that assignment names | `linkage.apply_relationship_status_in` → `foreign_scope`, covering both `resume` and `set_status` | implemented |
+| I-161 | A settled directive is not re-decided; restating the same disposition converges, a different one refuses, and the contest is retained rather than rolled back with the refusal | `linkage.settle_directive` → `link_conflict`, recorded through `_record_conflict_in` before the error is raised | implemented |
+| I-162 | A read reports ambiguity rather than choosing a row, whether the ambiguity is two edges for one scope pair, two execution edges into one scope, or two candidate pairs for one message | `up`, `down` and `counterpart` answer `ambiguous` with the candidates, and none uses `LIMIT 1` to settle a contest. `down` separates the recursion path from the visited set, so a scope reached from two parents is contested ownership rather than a cycle | implemented |
+| I-163 | A lookup failure is never reported as absence or as completion | `up`, `down` and `counterpart` carry `readable` and a `detail`, and answer `unreadable` rather than empty | implemented |
+| I-164 | A relationship releases its issue scope once, when it stops being live, so a later write from an already-dead row cannot take a scope claimed directly in the meantime | `linkage.apply_relationship_status_in` compares the status the relationship held BEFORE the write | implemented |
+| I-165 | A task that takes a scope back carries the endpoint it is running from now, not the one from its previous tenure, including a host it has moved to | `apply_binding_plan` and `handover` write `host_id`, `cwd` and `cxc_session` on reactivation rather than only the status; `linkage-handover` accepts all three; the host-mismatch refusal applies to a LIVE binding, where two hosts genuinely contradict each other | implemented |
+| I-166 | A replacement takes the issue binding only from a predecessor that is still live and still holds it, so a reclaimed issue produces a refusal rather than an index violation | `linkage.replaceable_child_in`, decided inside each write transaction | implemented |
+| I-167 | A successor replaces the assignment for its OWN issue; naming a predecessor from another issue is refused rather than archiving that unrelated assignment | `registry._register_in_transaction` → `relationship_conflict`, with `attach_refusal` holding the same line independently | implemented |
+| I-168 | Restoring a binding records the status the caller asked for, the same way the first claim does | `apply_binding_plan` reactivation uses the supplied status rather than forcing `active` | implemented |
+| I-169 | An assignment comes back only through the validated path: `set_status` refuses any transition from a dead status into a live one, so `paused` is not a quieter way in than `active`, and `resume` restores the lower level after restating the generation and scope | `registry._write_status` → `relationship_not_active`; `apply_relationship_status_in` tests `lower in LIVE` so the restore runs for whichever live status resume writes | implemented |
+| I-170 | A store that already violates one of the partial unique indexes still opens, and says which index it could not enforce | `store.GUARD_INDEXES` applied after the schema script, with `unenforced_indexes` recording a refusal instead of failing the open | implemented |
+| I-171 | A contest decided after the pre-check survives the rollback that refuses it | the refusal travels on the raised error and is re-recorded in its own transaction, so it belongs to one call rather than to the `Registry` object | implemented |
+| I-172 | A scope with two live owners is reported as a contest, never resolved to one of them | `linkage.owners` and `_sole_owner`: `up`, `down`, `counterpart` and `attachment` answer with `competing_owners` and both candidates, and never report two owners as a gap. `owner()` keeps its single-row answer for the write paths, which run against an installed index and refuse a second owner before it exists | implemented |
+
 ## Recorded limits, so a row above is not read as more than it is
 
 | Limit | Consequence |
 |---|---|
+| Linkage records levels; it does not carry a peer MESSAGE | a registered peer link is a record, not a channel. Delivery, acknowledgement and shared merge order between parents belong to their own issues, and nothing in the rows above shows a message was transported between two parents |
+| These rows are proved against a temporary store | the evidence is `packages/codex-session-relay/tests/test_linkage*.py`. Whether an installed relay on a real host records any of this is separate evidence, and a green suite is not an installed runtime |
+| Codex native parentage is untouched | these are relay-owned records. Nothing here writes or reads a Codex native `parentThreadId`, so a claim that a thread is registered in the host's own hierarchy or its UI needs host evidence and cannot be read off these rows |
 | Ordering is not lineage | a later turn is admitted only by an explicit continuation record; host ordering corroborates and can contradict, never admits |
 | Byte stability is enforced only under a read lease | the lease is opt-in because holding one blocks writers for the kernel lease-break timeout; otherwise each detector has a named evasion |
 | Inode ownership is not proven | a hardlink or bind mount can expose the same bytes under another authorized path, which the contract permits because it authorizes paths |

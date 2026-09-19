@@ -10,13 +10,14 @@ registration is not the execution anyone authorized.
 
 import json
 
-from .errors import RefusalReason, RegistrationError
+from .errors import RefusalReason, RegistrationError, RelayError
 from .identity import relationship_id
 from .models import Endpoint
 
 ACTIVE = "active"
 STATUSES = ("active", "paused", "cancelled", "archived")
 DEACTIVATIONS = ("paused", "cancelled", "archived")
+LIVE = ("active", "paused")
 ANCHOR_BOUND = "bound"
 ANCHOR_PENDING = "anchor_pending"
 REASONS = ("initial_assignment", "needs_changes_revision")
@@ -42,6 +43,21 @@ class Registry:
     def __init__(self, store, clock):
         self.store = store
         self.clock = clock
+        self._linkage = None
+
+    @property
+    def linkage(self):
+        """The three-level linkage, built on demand.
+
+        Lazy because linkage imports assignment, which imports criteria, and registry is
+        constructed by almost everything. Nothing here changes unless a caller supplies a
+        project.
+        """
+        if self._linkage is None:
+            from .linkage import Linkage
+
+            self._linkage = Linkage(self.store, self.clock)
+        return self._linkage
 
     # ---------------------------------------------------------------- reading
 
@@ -91,12 +107,18 @@ class Registry:
         scope_ref: str | None = None,
         dispatch_turn_id: str | None = None,
         supersedes: str | None = None,
+        project_key: str | None = None,
     ) -> dict:
         """Deterministic and idempotent.
 
         Re-registering the same pair with the same scope returns the existing record and
         opens no new generation, so an uncertain response can simply be repeated. Re-using
         the identity with a DIFFERENT scope is a conflict, not a silent overwrite.
+
+        project_key is optional and additive. Supplied, the transaction that inserts the
+        relationship also writes its whole lower level through linkage.attach_in, so an
+        assignment and the project it belongs to are one atomic fact rather than two that can
+        disagree after a crash. Omitted, every byte of this method's behaviour is what it was.
         """
         roots = [str(r) for r in artifact_roots]
         recipients = [str(r) for r in allowed_recipients]
@@ -107,6 +129,17 @@ class Registry:
             )
         rid = relationship_id(parent.task_id, child.task_id, issue_key)
         dispatch_turn_id = validated_turn_id(dispatch_turn_id)
+        if project_key is None and supersedes:
+            # A replacement takes over the SAME issue, so it belongs to the same project. Left
+            # to the caller, superseding a scoped assignment without restating the project
+            # archived the outgoing child binding and the project-to-issue edge and attached
+            # no successor, so the issue silently lost its level.
+            inherited = self.store.one(
+                "SELECT s.project_key FROM relationship_scope s"
+                "  JOIN relationships r ON r.relationship_id = s.relationship_id"
+                " WHERE s.relationship_id = ? AND r.issue_key = ?",
+                (supersedes, issue_key))
+            project_key = inherited["project_key"] if inherited else None
         existing = self.store.one("SELECT * FROM relationships WHERE relationship_id = ?", (rid,))
         if existing is not None:
             record = self._row_to_record(existing)
@@ -121,9 +154,115 @@ class Registry:
                     RefusalReason.RELATIONSHIP_CONFLICT,
                     f"{rid!r} already exists with a different scope or hosts",
                 )
-            return record
+            if project_key is None:
+                return record
+            # An existing relationship never reaches the inserts below: they are
+            # unconditional, so falling through would collide on its own primary key. It gets
+            # its own path, and attach_in decides for itself which of its three facts are
+            # missing - so a fully attached relationship writes nothing and a partially
+            # attached one is completed rather than reported as already done.
+            recorded = self.store.one(
+                "SELECT project_key FROM relationship_scope WHERE relationship_id = ?", (rid,)
+            )
+            if recorded is not None and recorded["project_key"] != project_key:
+                raise RegistrationError(
+                    RefusalReason.RELATIONSHIP_CONFLICT,
+                    f"{rid!r} is already scoped to project "
+                    f"{recorded['project_key']!r}, not {project_key!r}",
+                )
+            refusal = None
+            with self.store.transaction() as db:
+                # Re-read inside the transaction. The row above was read before BEGIN
+                # IMMEDIATE, so another writer could have archived or superseded it in
+                # between, and attaching from a stale row would bind a child to an
+                # assignment that no longer owns its issue.
+                fresh = db.execute(
+                    "SELECT * FROM relationships WHERE relationship_id = ?", (rid,)
+                ).fetchone()
+                if fresh is None:
+                    raise RegistrationError(
+                        RefusalReason.UNREGISTERED_RELATIONSHIP, f"no relationship {rid!r}")
+                refusal = self.linkage.attach_in(db, fresh, project_key)
+                if refusal is not None:
+                    self.linkage.record_conflict_in(db, refusal, at=self.clock.iso())
+            if refusal is not None:
+                raise refusal.error()
+            return self.get(rid)
         now = self.clock.iso()
+        if project_key is not None:
+            # Decide the lower level BEFORE anything is inserted, in a transaction that writes
+            # only the contest if there is one. Inserting the relationship first and then
+            # discovering its project is foreign would roll the relationship back AND lose the
+            # conflict row with it, which is the one thing a refusal must not do.
+            # A replacement takes over the issue scope from the assignment it supersedes, so
+            # that outgoing child is not a rival. Named explicitly rather than inferred, so
+            # anyone ELSE holding the scope is still a refusal.
+            pending = None
+            with self.store.transaction() as db:
+                # Decided under the same lock as the write it authorizes, and only when the
+                # predecessor is still live and still holds the binding. Read beforehand, it
+                # could name a child that had already released the issue and reclaimed it
+                # directly, which excuses the wrong rival.
+                outgoing = self.linkage.replaceable_child_in(db, supersedes)
+                candidate = {
+                    "relationship_id": rid, "issue_key": issue_key, "status": ACTIVE,
+                    "superseded_by": None, "parent_task_id": parent.task_id,
+                    "child_task_id": child.task_id, "child_host_id": child.host_id,
+                    "child_cwd": child.cwd, "child_cxc_session": child.cxc_session,
+                    # Carried so the pre-check can tell a genuine successor from an unrelated
+                    # registration; attach_refusal relaxes the parent rule only for the first.
+                    "supersedes": supersedes,
+                }
+                _plan, pending = self.linkage.attach_refusal(
+                    db, candidate, project_key, replacing=outgoing)
+                if pending is not None:
+                    self.linkage.record_conflict_in(db, pending, at=now)
+            if pending is not None:
+                raise pending.error()
+        try:
+            return self._register_in_transaction(
+                rid, parent, child, issue_key, roots, recipients, scope_ref,
+                dispatch_request_id, dispatch_turn_id, supersedes, project_key, now)
+        except RelayError as failure:
+            # Carried on the error rather than on self. Instance state made two concurrent
+            # registrations through ONE Registry able to read each other's contest, and a
+            # refusal that has to survive a rollback is the last thing that should depend on
+            # nobody sharing the object.
+            raced = getattr(failure, "raced_refusal", None)
+            if raced is not None:
+                with self.store.transaction() as db:
+                    self.linkage.record_conflict_in(db, raced, at=now)
+            raise
+
+    def _register_in_transaction(self, rid, parent, child, issue_key, roots, recipients,
+                                 scope_ref, dispatch_request_id, dispatch_turn_id,
+                                 supersedes, project_key, now):
         with self.store.transaction() as db:
+            # Re-decided inside THIS transaction rather than carried in: the pre-check ran in
+            # its own, and between them the predecessor can have been cancelled and its issue
+            # claimed directly.
+            if supersedes:
+                # A successor replaces the assignment for its OWN issue. Naming one that
+                # belongs to a different issue archived that unrelated live assignment on its
+                # way past and attached this issue under the prospective parent, so a project
+                # handover could then report nothing outstanding over work nobody had moved.
+                named = db.execute(
+                    "SELECT issue_key FROM relationships WHERE relationship_id = ?",
+                    (supersedes,),
+                ).fetchone()
+                if named is None:
+                    raise RegistrationError(
+                        RefusalReason.UNREGISTERED_RELATIONSHIP,
+                        f"supersedes names {supersedes!r}, which is not registered",
+                    )
+                if named["issue_key"] != issue_key:
+                    raise RegistrationError(
+                        RefusalReason.RELATIONSHIP_CONFLICT,
+                        f"supersedes names {supersedes!r}, which is assigned to issue "
+                        f"{named['issue_key']!r}, not {issue_key!r}; a successor replaces the "
+                        "assignment for its own issue",
+                    )
+            outgoing = self.linkage.replaceable_child_in(db, supersedes)
             # One issue, one responsible child, decided in the SAME transaction as the insert.
             # Checked beforehand, two connections could both see no rival and then insert
             # different children; BEGIN IMMEDIATE serialises writers, so the second one sees
@@ -132,20 +271,47 @@ class Registry:
             # A PAUSED assignment still owns its child. A pause is a temporary state of an
             # existing assignment, never permission to open a second one, so only an archived,
             # cancelled or superseded assignment releases the issue.
+            #
+            # Keyed on the relationship, not on the child. Excluding rows that share this
+            # child was meant to let a caller restate its own assignment, but an identical
+            # restatement derives the SAME id and returns long before this point - so the only
+            # thing the child exclusion actually admitted was the same child being registered
+            # for the same issue under a SECOND parent. That is two live assignments, two
+            # parents authorized to deliver, and a project whose owner matches neither.
             rival = db.execute(
-                "SELECT relationship_id, child_task_id, status FROM relationships"
+                "SELECT relationship_id, child_task_id, parent_task_id, status"
+                "  FROM relationships"
                 "  WHERE issue_key = ? AND status IN ('active','paused')"
-                "    AND superseded_by IS NULL AND child_task_id != ?",
-                (issue_key, child.task_id),
+                "    AND superseded_by IS NULL AND relationship_id != ?",
+                (issue_key, rid),
             ).fetchone()
             if rival is not None and rival["relationship_id"] != supersedes:
                 raise RegistrationError(
                     RefusalReason.DUPLICATE_ASSIGNMENT,
                     f"issue {issue_key!r} is already assigned to child "
                     f"{rival['child_task_id']!r} under {rival['relationship_id']!r} "
-                    f"({rival['status']}); reuse that assignment, or pass supersedes to "
-                    "replace it deliberately",
+                    f"({rival['status']}, parent {rival['parent_task_id']!r}); reuse that "
+                    "assignment, or pass supersedes to replace it deliberately",
                 )
+            if supersedes:
+                # BEFORE the successor is inserted. The lifecycle guard asks whether this
+                # relationship is still the live assignment for its issue, and once the
+                # replacement exists the answer for the predecessor is no - so archiving it
+                # afterwards would skip releasing the issue scope and the successor would
+                # collide with a binding nobody let go of.
+                outgoing_before = db.execute(
+                    "SELECT status FROM relationships WHERE relationship_id = ?",
+                    (supersedes,),
+                ).fetchone()
+                db.execute(
+                    "UPDATE relationships SET superseded_by = ?, status = 'archived',"
+                    " updated_at = ? WHERE relationship_id = ?",
+                    (rid, now, supersedes),
+                )
+                self.linkage.apply_relationship_status_in(
+                    db, supersedes, "archived",
+                    previous_status=(outgoing_before["status"]
+                                     if outgoing_before is not None else None))
             db.execute(
                 "INSERT INTO relationships (relationship_id, issue_key, status, parent_task_id,"
                 " parent_host_id, parent_cwd, parent_cxc_session, child_task_id, child_host_id,"
@@ -171,13 +337,26 @@ class Registry:
                     now if dispatch_turn_id else None,
                 ),
             )
-            if supersedes:
-                db.execute(
-                    "UPDATE relationships SET superseded_by = ?, status = 'archived',"
-                    " updated_at = ? WHERE relationship_id = ?",
-                    (rid, now, supersedes),
-                )
             self.store.journal("relationship_registered", rid, {"issueKey": issue_key}, at=now)
+            if project_key is not None:
+                fresh = db.execute(
+                    "SELECT * FROM relationships WHERE relationship_id = ?", (rid,)
+                ).fetchone()
+                # Re-decided inside the transaction that did the inserts, so a racing writer
+                # cannot slip between the pre-check and the write. A refusal here raises and
+                # rolls the whole registration back, which is correct: the contest was already
+                # recorded by the pre-check below, in a transaction that wrote nothing else.
+                refusal = self.linkage.attach_in(db, fresh, project_key, at=now,
+                                                 replacing=outgoing if supersedes else None)
+                if refusal is not None:
+                    # This one arose only in the window between the pre-check and this
+                    # transaction, so its contest has not been recorded. Raising here rolls
+                    # the whole registration back, which is right, and takes any conflict row
+                    # written in this transaction with it - so it is re-recorded afterwards,
+                    # in its own transaction, rather than lost with the rollback.
+                    failure = refusal.error()
+                    failure.raced_refusal = refusal
+                    raise failure
         return self.get(rid)
 
     def open_generation(
@@ -388,10 +567,34 @@ class Registry:
         self.get(rid)
         now = self.clock.iso()
         with self.store.transaction() as db:
+            # Read BEFORE the write. The lower level has to know whether this relationship was
+            # still live, and after the UPDATE below that fact is gone.
+            before = db.execute(
+                "SELECT status FROM relationships WHERE relationship_id = ?", (rid,)
+            ).fetchone()
+            if before is not None and before["status"] not in LIVE and status in LIVE:
+                # A dead assignment coming back is a reactivation whatever word it arrives
+                # under. set_status says so in its own docstring and then let 'paused' through
+                # because it is spelled like a deactivation: the lower level was restored
+                # without the generation and scope that resume() makes a caller restate, so a
+                # stale assignment regained its issue by naming a different live status.
+                raise RegistrationError(
+                    RefusalReason.RELATIONSHIP_NOT_ACTIVE,
+                    f"{rid!r} is {before['status']!r}, so {status!r} would bring it back to "
+                    "life. Restoring an assignment restates the generation and the scope it "
+                    "re-authorizes, which is relationship-resume; choosing a different live "
+                    "word does not make those checks optional",
+                )
             db.execute(
                 "UPDATE relationships SET status = ?, updated_at = ? WHERE relationship_id = ?",
                 (status, now, rid),
             )
+            # The lower level moves with the assignment, in the same transaction. A no-op for
+            # a relationship with no recorded project, which is every relationship registered
+            # without one.
+            self.linkage.apply_relationship_status_in(
+                db, rid, status,
+                previous_status=before["status"] if before is not None else None)
             self.store.journal("status_changed", rid, {"status": status, "actor": actor}, at=now)
         return self.get(rid)
 
@@ -473,6 +676,8 @@ class Registry:
                 "UPDATE relationships SET status = ?, updated_at = ? WHERE relationship_id = ?",
                 (ACTIVE, now, rid),
             )
+            self.linkage.apply_relationship_status_in(
+                db, rid, ACTIVE, previous_status=row["status"])
             self.store.journal(
                 "status_changed", rid, {"status": ACTIVE, "actor": actor}, at=now
             )
@@ -482,11 +687,21 @@ class Registry:
         self.get(old_rid)
         now = self.clock.iso()
         with self.store.transaction() as db:
+            # Inside the transaction, immediately before the write. Read outside it, another
+            # writer could cancel this relationship - releasing its issue - and the same child
+            # could reclaim that issue directly, while this call still believed it was moving a
+            # live assignment and archived the new claim on its way past.
+            before = db.execute(
+                "SELECT status FROM relationships WHERE relationship_id = ?", (old_rid,)
+            ).fetchone()
             db.execute(
                 "UPDATE relationships SET superseded_by = ?, status = 'archived', updated_at = ?"
                 " WHERE relationship_id = ?",
                 (new_relationship_id, now, old_rid),
             )
+            self.linkage.apply_relationship_status_in(
+                db, old_rid, "archived",
+                previous_status=before["status"] if before is not None else None)
             self.store.journal("superseded", old_rid, {"by": new_relationship_id}, at=now)
 
     # ---------------------------------------------------------------- records
